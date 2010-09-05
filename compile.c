@@ -4571,7 +4571,9 @@ iseq_compile_each(rb_iseq_t *iseq, LINK_ANCHOR *ret, NODE * node, int poped)
 	ADD_INSN1(ret, nd_line(node), putspecialobject, INT2FIX(VM_SPECIAL_OBJECT_CBASE));
 	ADD_INSN1(ret, nd_line(node), putobject, ID2SYM(node->nd_mid));
 	ADD_INSN1(ret, nd_line(node), putiseq, iseqval);
-	ADD_SEND (ret, nd_line(node), ID2SYM(id_core_define_method), INT2FIX(3));
+	ADD_INSN1(ret, nd_line(node), putobject,
+		  node->flags & NODE_FL_NESTED_DEF ? Qtrue : Qfalse);
+	ADD_SEND (ret, nd_line(node), ID2SYM(id_core_define_method), INT2FIX(4));
 
 	if (poped) {
 	    ADD_INSN(ret, nd_line(node), pop);

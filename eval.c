@@ -20,8 +20,10 @@
 #define numberof(array) (int)(sizeof(array) / sizeof((array)[0]))
 
 VALUE proc_invoke(VALUE, VALUE, VALUE, VALUE);
-VALUE rb_binding_new(void);
+VALUE rb_binding_new(int);
 NORETURN(void rb_raise_jump(VALUE));
+
+NODE *rb_vm_get_cref(const rb_iseq_t *, const VALUE *, const VALUE *);
 
 ID rb_frame_callee(void);
 VALUE rb_eLocalJumpError;
@@ -968,6 +970,70 @@ top_include(int argc, VALUE *argv, VALUE self)
     return rb_mod_include(argc, argv, rb_cObject);
 }
 
+void
+rb_overlay_module(NODE *cref, VALUE klass, VALUE module)
+{
+    VALUE iclass, c, superclass = klass;
+
+    Check_Type(module, T_MODULE);
+    if (NIL_P(cref->nd_omod)) {
+	cref->nd_omod = rb_hash_new();
+	rb_funcall(cref->nd_omod, rb_intern("compare_by_identity"), 0);
+    }
+    else {
+	if (cref->flags & NODE_FL_CREF_OMOD_SHARED) {
+	    cref->nd_omod = rb_hash_dup(cref->nd_omod);
+	    cref->flags &= ~NODE_FL_CREF_OMOD_SHARED;
+	}
+	if (!NIL_P(c = rb_hash_lookup(cref->nd_omod, klass))) {
+	    superclass = c;
+	}
+    }
+    c = iclass = rb_include_class_new(module, superclass);
+    module = RCLASS_SUPER(module);
+    while (module) {
+	c = RCLASS_SUPER(c) = rb_include_class_new(module, RCLASS_SUPER(c));
+	module = RCLASS_SUPER(module);
+    }
+    rb_hash_aset(cref->nd_omod, klass, iclass);
+    rb_clear_cache_by_class(klass);
+}
+
+/*
+ *  call-seq:
+ *     overlay_module(klass, mod [, binding])
+ *
+ *  Append features of <i>mod</i> to <i>klass</i> only in the scope where
+ *  <code>overlay_module</code> is called.
+ */
+
+static VALUE
+f_overlay_module(int argc, VALUE *argv, VALUE self)
+{
+    VALUE klass, module, binding;
+    NODE *cref;
+
+    rb_scan_args(argc, argv, "21", &klass, &module, &binding);
+    if (NIL_P(binding)) {
+	cref = rb_vm_cref();
+    }
+    else {
+	rb_binding_t *bind;
+	rb_env_t *env;
+
+	if (!rb_obj_is_kind_of(binding, rb_cBinding)) {
+	    rb_raise(rb_eTypeError,
+		     "wrong argument type %s (expected Binding)",
+		     rb_obj_classname(binding));
+	}
+	GetBindingPtr(binding, bind);
+	GetEnvPtr(bind->env, env);
+	cref = rb_vm_get_cref(env->block.iseq, env->block.lfp, env->block.dfp);
+    }
+    rb_overlay_module(cref, klass, module);
+    return Qnil;
+}
+
 VALUE rb_f_trace_var();
 VALUE rb_f_untrace_var();
 
@@ -1134,6 +1200,8 @@ Init_eval(void)
     rb_define_singleton_method(rb_cModule, "constants", rb_mod_s_constants, -1);
 
     rb_define_singleton_method(rb_vm_top_self(), "include", top_include, -1);
+
+    rb_define_global_function("overlay_module", f_overlay_module, -1);
 
     rb_define_method(rb_mKernel, "extend", rb_obj_extend, -1);
 

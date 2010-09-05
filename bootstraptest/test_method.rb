@@ -287,16 +287,17 @@ assert_equal '1',       %q( class C; def m() 1 end end
 assert_equal '1',       %q( class C
                               def m
                                 def mm() 1 end
+                                mm
                               end
                             end
-                            C.new.m
-                            C.new.mm )
+                            C.new.m )
 assert_equal '1',       %q( class C
                               def m
                                 def mm() 1 end
+                                mm
                               end
                             end
-                            instance_eval "C.new.m; C.new.mm" )
+                            instance_eval "C.new.m" )
 
 # method_missing
 assert_equal ':m',      %q( class C

@@ -2953,6 +2953,8 @@ primary		: literal
 			reduce_nodes(&body);
 			$$ = NEW_DEFN($2, $4, body, NOEX_PRIVATE);
 			nd_set_line($$, $<num>1);
+			if (in_def > 1 || in_single > 0)
+			    $$->flags |= NODE_FL_NESTED_DEF;
 		    /*%
 			$$ = dispatch3(def, $2, $4, $5);
 		    %*/

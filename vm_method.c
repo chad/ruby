@@ -4,7 +4,7 @@
 
 #define CACHE_SIZE 0x800
 #define CACHE_MASK 0x7ff
-#define EXPR1(c,m) ((((c)>>3)^(m))&CACHE_MASK)
+#define EXPR1(c,o,m) ((((c)>>3)^((o)>>3)^(m))&CACHE_MASK)
 
 static void rb_vm_check_redefinition_opt_method(const rb_method_entry_t *me);
 
@@ -15,7 +15,9 @@ static ID added, singleton_added, attached;
 struct cache_entry {		/* method hash table. */
     ID mid;			/* method's id */
     VALUE klass;		/* receiver's class */
+    VALUE omod;			/* overlay modules */
     rb_method_entry_t *me;
+    VALUE defined_class;
 };
 
 static struct cache_entry cache[CACHE_SIZE];
@@ -380,7 +382,7 @@ rb_get_alloc_func(VALUE klass)
 {
     rb_method_entry_t *me;
     Check_Type(klass, T_CLASS);
-    me = rb_method_entry(CLASS_OF(klass), ID_ALLOCATOR);
+    me = rb_method_entry(CLASS_OF(klass), ID_ALLOCATOR, 0);
 
     if (me && me->def && me->def->type == VM_METHOD_TYPE_CFUNC) {
 	return (rb_alloc_func_t)me->def->body.cfunc.func;
@@ -391,20 +393,32 @@ rb_get_alloc_func(VALUE klass)
 }
 
 static rb_method_entry_t*
-search_method(VALUE klass, ID id)
+search_method(VALUE klass, ID id, VALUE omod, VALUE *defined_class_ptr)
 {
     st_data_t body;
+    VALUE iclass, skipped_class = Qnil;
+
     if (!klass) {
 	return 0;
     }
 
+    if (!NIL_P(omod) && !NIL_P(iclass = rb_hash_lookup(omod, klass))) {
+	klass = iclass;
+    }
     while (!st_lookup(RCLASS_M_TBL(klass), id, &body)) {
 	klass = RCLASS_SUPER(klass);
+	if (!NIL_P(omod) && klass != skipped_class &&
+	    !NIL_P(iclass = rb_hash_lookup(omod, klass))) {
+	    skipped_class = klass;
+	    klass = iclass;
+	}
 	if (!klass) {
 	    return 0;
 	}
     }
 
+    if (defined_class_ptr)
+	*defined_class_ptr = klass;
     return (rb_method_entry_t *)body;
 }
 
@@ -415,14 +429,19 @@ search_method(VALUE klass, ID id)
  * rb_method_entry() simply.
  */
 rb_method_entry_t *
-rb_method_entry_get_without_cache(VALUE klass, ID id)
+rb_method_entry_get_without_cache(VALUE klass, VALUE omod, ID id, VALUE *defined_class_ptr)
 {
-    rb_method_entry_t *me = search_method(klass, id);
+    VALUE iclass, defined_class;
+    rb_method_entry_t *me;
+
+    me = search_method(klass, id, omod, &defined_class);
 
     if (ruby_running) {
 	struct cache_entry *ent;
-	ent = cache + EXPR1(klass, id);
+	ent = cache + EXPR1(klass, omod, id);
 	ent->klass = klass;
+	ent->omod = omod;
+	ent->defined_class = defined_class;
 
 	if (UNDEFINED_METHOD_ENTRY_P(me)) {
 	    ent->mid = id;
@@ -435,20 +454,31 @@ rb_method_entry_get_without_cache(VALUE klass, ID id)
 	}
     }
 
+    if (defined_class_ptr)
+	*defined_class_ptr = defined_class;
     return me;
 }
 
 rb_method_entry_t *
-rb_method_entry(VALUE klass, ID id)
+rb_method_entry(VALUE klass, ID id, VALUE *defined_class_ptr)
 {
     struct cache_entry *ent;
+    NODE *cref = rb_vm_cref();
+    VALUE omod = Qnil;
 
-    ent = cache + EXPR1(klass, id);
-    if (ent->mid == id && ent->klass == klass) {
+    if (cref && !NIL_P(cref->nd_omod)) {
+	omod = cref->nd_omod;
+    }
+
+    ent = cache + EXPR1(klass, omod, id);
+    if (ent->mid == id && ent->klass == klass && ent->omod == omod) {
+	if (defined_class_ptr)
+	    *defined_class_ptr = ent->defined_class;
 	return ent->me;
     }
 
-    return rb_method_entry_get_without_cache(klass, id);
+    return rb_method_entry_get_without_cache(klass, omod, id,
+					     defined_class_ptr);
 }
 
 static void
@@ -534,14 +564,15 @@ static void
 rb_export_method(VALUE klass, ID name, rb_method_flag_t noex)
 {
     rb_method_entry_t *me;
+    VALUE defined_class;
 
     if (klass == rb_cObject) {
 	rb_secure(4);
     }
 
-    me = search_method(klass, name);
+    me = search_method(klass, name, Qnil, &defined_class);
     if (!me && TYPE(klass) == T_MODULE) {
-	me = search_method(rb_cObject, name);
+	me = search_method(rb_cObject, name, Qnil, &defined_class);
     }
 
     if (UNDEFINED_METHOD_ENTRY_P(me)) {
@@ -551,7 +582,7 @@ rb_export_method(VALUE klass, ID name, rb_method_flag_t noex)
     if (me->flag != noex) {
 	rb_vm_check_redefinition_opt_method(me);
 
-	if (klass == me->klass) {
+	if (klass == defined_class) {
 	    me->flag = noex;
 	}
 	else {
@@ -563,7 +594,7 @@ rb_export_method(VALUE klass, ID name, rb_method_flag_t noex)
 int
 rb_method_boundp(VALUE klass, ID id, int ex)
 {
-    rb_method_entry_t *me = rb_method_entry(klass, id);
+    rb_method_entry_t *me = rb_method_entry(klass, id, 0);
 
     if (me != 0) {
 	if ((ex & ~NOEX_RESPONDS) && (me->flag & NOEX_PRIVATE)) {
@@ -627,6 +658,8 @@ void
 rb_undef(VALUE klass, ID id)
 {
     rb_method_entry_t *me;
+    NODE *cref = rb_vm_cref();
+    VALUE omod = Qnil;
 
     if (NIL_P(klass)) {
 	rb_raise(rb_eTypeError, "no class to undef method");
@@ -642,7 +675,10 @@ rb_undef(VALUE klass, ID id)
 	rb_warn("undefining `%s' may cause serious problems", rb_id2name(id));
     }
 
-    me = search_method(klass, id);
+    if (cref && !NIL_P(cref->nd_omod)) {
+	omod = cref->nd_omod;
+    }
+    me = search_method(klass, id, omod, 0);
 
     if (UNDEFINED_METHOD_ENTRY_P(me)) {
 	const char *s0 = " class";
@@ -665,6 +701,16 @@ rb_undef(VALUE klass, ID id)
 		      rb_id2name(id), s0, rb_class2name(c));
     }
 
+    if (!RTEST(rb_class_inherited_p(klass, me->klass))) {
+	if (FL_TEST(me->klass, RMODULE_HAS_NESTED_METHODS)) {
+	    klass = me->klass;
+	}
+	else {
+	    VALUE mod = rb_module_new();
+	    rb_overlay_module(cref, klass, mod);
+	    klass = mod;
+	}
+    }
     rb_add_method(klass, id, VM_METHOD_TYPE_UNDEF, 0, NOEX_PUBLIC);
 
     CALL_METHOD_HOOK(klass, undefined, id);
@@ -765,7 +811,7 @@ static VALUE
 check_definition(VALUE mod, ID mid, rb_method_flag_t noex)
 {
     const rb_method_entry_t *me;
-    me = rb_method_entry(mod, mid);
+    me = rb_method_entry(mod, mid, 0);
     if (me) {
 	if (VISI_CHECK(me->flag, noex))
 	    return Qtrue;
@@ -926,11 +972,12 @@ rb_alias(VALUE klass, ID name, ID def)
     }
 
   again:
-    orig_me = search_method(klass, def);
+    orig_me = search_method(klass, def, Qnil, 0);
 
     if (UNDEFINED_METHOD_ENTRY_P(orig_me)) {
 	if ((TYPE(klass) != T_MODULE) ||
-	    (orig_me = search_method(rb_cObject, def), UNDEFINED_METHOD_ENTRY_P(orig_me))) {
+	    (orig_me = search_method(rb_cObject, def, Qnil, 0),
+				     UNDEFINED_METHOD_ENTRY_P(orig_me))) {
 	    rb_print_undef(klass, def, 0);
 	}
     }
@@ -1191,9 +1238,9 @@ rb_mod_modfunc(int argc, VALUE *argv, VALUE module)
 
 	id = rb_to_id(argv[i]);
 	for (;;) {
-	    me = search_method(m, id);
+	    me = search_method(m, id, Qnil, 0);
 	    if (me == 0) {
-		me = search_method(rb_cObject, id);
+		me = search_method(rb_cObject, id, Qnil, 0);
 	    }
 	    if (UNDEFINED_METHOD_ENTRY_P(me)) {
 		rb_print_undef(module, id, 0);
@@ -1213,7 +1260,7 @@ rb_mod_modfunc(int argc, VALUE *argv, VALUE module)
 int
 rb_method_basic_definition_p(VALUE klass, ID id)
 {
-    const rb_method_entry_t *me = rb_method_entry(klass, id);
+    const rb_method_entry_t *me = rb_method_entry(klass, id, 0);
     if (me && (me->flag & NOEX_BASIC))
 	return 1;
     return 0;

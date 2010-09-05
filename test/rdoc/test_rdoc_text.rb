@@ -62,8 +62,8 @@ The comments associated with
     assert_equal expected, flush_left(text)
   end
 
+  def formatter() RDoc::Markup::ToHtml.new end
   def test_markup
-    def formatter() RDoc::Markup::ToHtml.new end
 
     assert_equal "<p>\nhi\n</p>\n", markup('hi')
   end

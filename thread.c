@@ -4074,7 +4074,7 @@ call_trace_proc(VALUE args, int tracing)
     argv[1] = filename;
     argv[2] = INT2FIX(line);
     argv[3] = id ? ID2SYM(id) : Qnil;
-    argv[4] = (p->self && srcfile) ? rb_binding_new() : Qnil;
+    argv[4] = (p->self && srcfile) ? rb_binding_new(0) : Qnil;
     argv[5] = klass ? klass : Qnil;
 
     return rb_proc_call_with_block(p->proc, 6, argv, Qnil);

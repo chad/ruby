@@ -15,6 +15,7 @@
 struct METHOD {
     VALUE recv;
     VALUE rclass;
+    VALUE defined_class;
     ID id;
     rb_method_entry_t me;
 };
@@ -310,13 +311,21 @@ binding_clone(VALUE self)
 }
 
 VALUE
-rb_binding_new(void)
+rb_binding_new(int level)
 {
     rb_thread_t *th = GET_THREAD();
     rb_control_frame_t *cfp = rb_vm_get_ruby_level_next_cfp(th, th->cfp);
     VALUE bindval = binding_alloc(rb_cBinding);
     rb_binding_t *bind;
+    int i;
 
+    if (level < 0) {
+	rb_raise(rb_eArgError, "level should not be negative: %d", level);
+    }
+    for (i = 0; i < level && cfp; i++) {
+	cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+	cfp = rb_vm_get_ruby_level_next_cfp(th, cfp);
+    }
     if (cfp == 0) {
 	rb_raise(rb_eRuntimeError, "Can't create Binding Object on top of Fiber.");
     }
@@ -345,9 +354,16 @@ rb_binding_new(void)
  */
 
 static VALUE
-rb_f_binding(VALUE self)
+rb_f_binding(int argc, VALUE *argv, VALUE self)
 {
-    return rb_binding_new();
+    VALUE vlevel;
+    int level = 0;
+
+    rb_scan_args(argc, argv, "01", &vlevel);
+    if (!NIL_P(vlevel)) {
+	level = NUM2INT(vlevel);
+    }
+    return rb_binding_new(level);
 }
 
 /*
@@ -861,6 +877,7 @@ static void
 bm_mark(void *ptr)
 {
     struct METHOD *data = ptr;
+    rb_gc_mark(data->defined_class);
     rb_gc_mark(data->rclass);
     rb_gc_mark(data->recv);
     rb_mark_method_entry(&data->me);
@@ -903,7 +920,7 @@ static VALUE
 mnew(VALUE klass, VALUE obj, ID id, VALUE mclass, int scope)
 {
     VALUE method;
-    VALUE rclass = klass;
+    VALUE rclass = klass, defined_class;
     ID rid = id;
     struct METHOD *data;
     rb_method_entry_t *me, meb;
@@ -911,7 +928,7 @@ mnew(VALUE klass, VALUE obj, ID id, VALUE mclass, int scope)
     rb_method_flag_t flag = NOEX_UNDEF;
 
   again:
-    me = rb_method_entry(klass, id);
+    me = rb_method_entry(klass, id, &defined_class);
     if (UNDEFINED_METHOD_ENTRY_P(me)) {
 	ID rmiss = rb_intern("respond_to_missing?");
 	VALUE sym = ID2SYM(id);
@@ -953,12 +970,12 @@ mnew(VALUE klass, VALUE obj, ID id, VALUE mclass, int scope)
 	}
     }
     if (def && def->type == VM_METHOD_TYPE_ZSUPER) {
-	klass = RCLASS_SUPER(me->klass);
+	klass = RCLASS_SUPER(defined_class);
 	id = def->original_id;
 	goto again;
     }
 
-    klass = me->klass;
+    klass = defined_class;
 
     while (rclass != klass &&
 	   (FL_TEST(rclass, FL_SINGLETON) || TYPE(rclass) == T_ICLASS)) {
@@ -974,6 +991,7 @@ mnew(VALUE klass, VALUE obj, ID id, VALUE mclass, int scope)
 
     data->recv = obj;
     data->rclass = rclass;
+    data->defined_class = defined_class;
     data->id = rid;
     data->me = *me;
     if (def) def->alias_count++;
@@ -1085,6 +1103,7 @@ method_unbind(VALUE obj)
     data->me = orig->me;
     if (orig->me.def) orig->me.def->alias_count++;
     data->rclass = orig->rclass;
+    data->defined_class = orig->defined_class;
     OBJ_INFECT(method, obj);
 
     return method;
@@ -1421,10 +1440,10 @@ rb_method_call(int argc, VALUE *argv, VALUE method)
     if ((state = EXEC_TAG()) == 0) {
 	rb_thread_t *th = GET_THREAD();
 	VALUE rb_vm_call(rb_thread_t *th, VALUE recv, VALUE id, int argc, const VALUE *argv,
-			 const rb_method_entry_t *me);
+			 const rb_method_entry_t *me, VALUE defined_class);
 
 	PASS_PASSED_BLOCK_TH(th);
-	result = rb_vm_call(th, data->recv, data->id,  argc, argv, &data->me);
+	result = rb_vm_call(th, data->recv, data->id,  argc, argv, &data->me, data->defined_class);
     }
     POP_TAG();
     if (safe >= 0)
@@ -1648,7 +1667,7 @@ method_arity(VALUE method)
 int
 rb_mod_method_arity(VALUE mod, ID id)
 {
-    rb_method_entry_t *me = rb_method_entry(mod, id);
+    rb_method_entry_t *me = rb_method_entry(mod, id, 0);
     return rb_method_entry_arity(me);
 }
 
@@ -2234,6 +2253,6 @@ Init_Binding(void)
     rb_define_method(rb_cBinding, "clone", binding_clone, 0);
     rb_define_method(rb_cBinding, "dup", binding_dup, 0);
     rb_define_method(rb_cBinding, "eval", bind_eval, -1);
-    rb_define_global_function("binding", rb_f_binding, 0);
+    rb_define_global_function("binding", rb_f_binding, -1);
 }
 

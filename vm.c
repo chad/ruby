@@ -69,7 +69,7 @@ static inline VALUE
 rb_vm_set_finish_env(rb_thread_t * th)
 {
     vm_push_frame(th, 0, VM_FRAME_MAGIC_FINISH,
-		  Qnil, th->cfp->lfp[0], 0,
+		  Qnil, Qnil, th->cfp->lfp[0], 0,
 		  th->cfp->sp, 0, 1);
     th->cfp->pc = (VALUE *)&finish_insn_seq[0];
     return Qtrue;
@@ -89,7 +89,7 @@ vm_set_top_stack(rb_thread_t * th, VALUE iseqval)
     rb_vm_set_finish_env(th);
 
     vm_push_frame(th, iseq, VM_FRAME_MAGIC_TOP,
-		  th->top_self, 0, iseq->iseq_encoded,
+		  th->top_self, rb_cObject, 0, iseq->iseq_encoded,
 		  th->cfp->sp, 0, iseq->local_size);
 
     CHECK_STACK_OVERFLOW(th->cfp, iseq->stack_max);
@@ -104,7 +104,7 @@ vm_set_eval_stack(rb_thread_t * th, VALUE iseqval, const NODE *cref)
 
     /* for return */
     rb_vm_set_finish_env(th);
-    vm_push_frame(th, iseq, VM_FRAME_MAGIC_EVAL, block->self,
+    vm_push_frame(th, iseq, VM_FRAME_MAGIC_EVAL, block->self, block->klass,
 		  GC_GUARDED_PTR(block->dfp), iseq->iseq_encoded,
 		  th->cfp->sp, block->lfp, iseq->local_size);
 
@@ -495,6 +495,7 @@ rb_vm_make_proc(rb_thread_t *th, const rb_block_t *block, VALUE klass)
     GetProcPtr(procval, proc);
     proc->blockprocval = blockprocval;
     proc->block.self = block->self;
+    proc->block.klass = block->klass;
     proc->block.lfp = block->lfp;
     proc->block.dfp = block->dfp;
     proc->block.iseq = block->iseq;
@@ -544,9 +545,11 @@ invoke_block_from_c(rb_thread_t *th, const rb_block_t *block,
 				     type == VM_FRAME_MAGIC_LAMBDA);
 
 	ncfp = vm_push_frame(th, iseq, type,
-			     self, GC_GUARDED_PTR(block->dfp),
+			     self, th->passed_defined_class,
+			     GC_GUARDED_PTR(block->dfp),
 			     iseq->iseq_encoded + opt_pc, cfp->sp + arg_size, block->lfp,
 			     iseq->local_size - arg_size);
+	th->passed_defined_class = 0;
 	ncfp->me = th->passed_me;
 	th->passed_me = 0;
 
@@ -819,7 +822,8 @@ rb_vm_cref(void)
 {
     rb_thread_t *th = GET_THREAD();
     rb_control_frame_t *cfp = rb_vm_get_ruby_level_next_cfp(th, th->cfp);
-    return vm_get_cref(cfp->iseq, cfp->lfp, cfp->dfp);
+    if (!cfp) return NULL;
+    return rb_vm_get_cref(cfp->iseq, cfp->lfp, cfp->dfp);
 }
 
 #if 0
@@ -1320,7 +1324,8 @@ vm_exec(rb_thread_t *th)
 	    /* push block frame */
 	    cfp->sp[0] = err;
 	    vm_push_frame(th, catch_iseq, VM_FRAME_MAGIC_BLOCK,
-			  cfp->self, (VALUE)cfp->dfp, catch_iseq->iseq_encoded,
+			  cfp->self, cfp->klass,
+			  (VALUE)cfp->dfp, catch_iseq->iseq_encoded,
 			  cfp->sp + 1 /* push value */, cfp->lfp, catch_iseq->local_size - 1);
 
 	    state = 0;
@@ -1458,7 +1463,7 @@ rb_vm_call_cfunc(VALUE recv, VALUE (*func)(VALUE), VALUE arg,
     VALUE val;
 
     vm_push_frame(th, DATA_PTR(iseqval), VM_FRAME_MAGIC_TOP,
-		  recv, (VALUE)blockptr, 0, reg_cfp->sp, 0, 1);
+		  recv, CLASS_OF(recv), (VALUE)blockptr, 0, reg_cfp->sp, 0, 1);
 
     val = (*func)(arg);
 
@@ -1671,6 +1676,7 @@ rb_thread_mark(void *ptr)
 	RUBY_MARK_UNLESS_NULL(th->root_fiber);
 	RUBY_MARK_UNLESS_NULL(th->stat_insn_usage);
 	RUBY_MARK_UNLESS_NULL(th->last_status);
+	RUBY_MARK_UNLESS_NULL(th->passed_defined_class);
 
 	RUBY_MARK_UNLESS_NULL(th->locking_mutex);
 
@@ -1794,7 +1800,7 @@ th_init2(rb_thread_t *th, VALUE self)
 
     th->cfp = (void *)(th->stack + th->stack_size);
 
-    vm_push_frame(th, 0, VM_FRAME_MAGIC_TOP, Qnil, 0, 0,
+    vm_push_frame(th, 0, VM_FRAME_MAGIC_TOP, Qnil, Qnil, 0, 0,
 		  th->stack, 0, 1);
 
     th->status = THREAD_RUNNABLE;
@@ -1835,14 +1841,37 @@ rb_thread_alloc(VALUE klass)
     return self;
 }
 
+static VALUE
+find_module_for_nested_methods(NODE *cref, VALUE klass)
+{
+    VALUE iclass;
+
+    if (NIL_P(cref->nd_omod))
+	return Qnil;
+    iclass = rb_hash_lookup(cref->nd_omod, klass);
+    if (NIL_P(iclass))
+	return Qnil;
+    while (iclass) {
+	VALUE module = RBASIC(iclass)->klass;
+	if (FL_TEST(module, RMODULE_HAS_NESTED_METHODS)) {
+	    return module;
+	}
+	iclass = RCLASS_SUPER(iclass);
+    }
+    return Qnil;
+}
+
 VALUE rb_iseq_clone(VALUE iseqval, VALUE newcbase);
 
 static void
-vm_define_method(rb_thread_t *th, VALUE obj, ID id, VALUE iseqval,
+vm_define_method(rb_thread_t *th, VALUE obj, ID id, VALUE iseqval, VALUE nested,
 		 rb_num_t is_singleton, NODE *cref)
 {
     VALUE klass = cref->nd_clss;
+    VALUE target, defined_class;
+    rb_method_entry_t *me;
     int noex = (int)cref->nd_visi;
+    int is_nested = RTEST(nested);
     rb_iseq_t *miseq;
     GetISeqPtr(iseqval, miseq);
 
@@ -1870,11 +1899,30 @@ vm_define_method(rb_thread_t *th, VALUE obj, ID id, VALUE iseqval,
 	noex = NOEX_PUBLIC;
     }
 
+    if (is_nested && th->cfp->lfp == th->cfp->dfp) {
+	target = find_module_for_nested_methods(cref, klass);
+	if (NIL_P(target)) {
+	    target = rb_module_new();
+	    FL_SET(target, RMODULE_HAS_NESTED_METHODS);
+	    rb_overlay_module(cref, klass, target);
+	}
+	else {
+	    me = search_method(target, id, Qnil, &defined_class);
+	    if (me && me->def->type == VM_METHOD_TYPE_ISEQ &&
+		me->def->body.iseq == miseq) {
+		return;
+	    }
+	}
+	noex = NOEX_PRIVATE;
+    }
+    else {
+	target = klass;
+    }
     /* dup */
     COPY_CREF(miseq->cref_stack, cref);
-    miseq->klass = klass;
+    miseq->klass = target;
     miseq->defined_method_id = id;
-    rb_add_method(klass, id, VM_METHOD_TYPE_ISEQ, miseq, noex);
+    rb_add_method(target, id, VM_METHOD_TYPE_ISEQ, miseq, noex);
 
     if (!is_singleton && noex == NOEX_MODFUNC) {
 	rb_add_method(rb_singleton_class(klass), id, VM_METHOD_TYPE_ISEQ, miseq, NOEX_PUBLIC);
@@ -1888,10 +1936,10 @@ vm_define_method(rb_thread_t *th, VALUE obj, ID id, VALUE iseqval,
 } while (0)
 
 static VALUE
-m_core_define_method(VALUE self, VALUE cbase, VALUE sym, VALUE iseqval)
+m_core_define_method(VALUE self, VALUE cbase, VALUE sym, VALUE iseqval, VALUE nested)
 {
     REWIND_CFP({
-	vm_define_method(GET_THREAD(), cbase, SYM2ID(sym), iseqval, 0, rb_vm_cref());
+	vm_define_method(GET_THREAD(), cbase, SYM2ID(sym), iseqval, nested, 0, rb_vm_cref());
     });
     return Qnil;
 }
@@ -1900,7 +1948,7 @@ static VALUE
 m_core_define_singleton_method(VALUE self, VALUE cbase, VALUE sym, VALUE iseqval)
 {
     REWIND_CFP({
-	vm_define_method(GET_THREAD(), cbase, SYM2ID(sym), iseqval, 1, rb_vm_cref());
+	vm_define_method(GET_THREAD(), cbase, SYM2ID(sym), iseqval, Qfalse, 1, rb_vm_cref());
     });
     return Qnil;
 }
@@ -2016,7 +2064,7 @@ Init_VM(void)
     rb_define_method_id(klass, id_core_set_method_alias, m_core_set_method_alias, 3);
     rb_define_method_id(klass, id_core_set_variable_alias, m_core_set_variable_alias, 2);
     rb_define_method_id(klass, id_core_undef_method, m_core_undef_method, 2);
-    rb_define_method_id(klass, id_core_define_method, m_core_define_method, 3);
+    rb_define_method_id(klass, id_core_define_method, m_core_define_method, 4);
     rb_define_method_id(klass, id_core_define_singleton_method, m_core_define_singleton_method, 3);
     rb_define_method_id(klass, id_core_set_postexe, m_core_set_postexe, 1);
     rb_obj_freeze(fcore);
@@ -2108,7 +2156,7 @@ Init_VM(void)
 	th->cfp->pc = iseq->iseq_encoded;
 	th->cfp->self = th->top_self;
 
-	rb_define_global_const("TOPLEVEL_BINDING", rb_binding_new());
+	rb_define_global_const("TOPLEVEL_BINDING", rb_binding_new(0));
     }
     vm_init_redefined_flag();
 }

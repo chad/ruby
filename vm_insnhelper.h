@@ -149,15 +149,24 @@ extern VALUE ruby_vm_const_missing_count;
 /* deal with control flow 2: method/iterator              */
 /**********************************************************/
 
+#define COPY_CREF_OMOD(c1, c2) do {  \
+  c1->nd_omod = c2->nd_omod; \
+  if (!NIL_P(c2->nd_omod)) { \
+      c1->flags |= NODE_FL_CREF_OMOD_SHARED; \
+      c2->flags |= NODE_FL_CREF_OMOD_SHARED; \
+  } \
+} while (0)
+
 #define COPY_CREF(c1, c2) do {  \
   NODE *__tmp_c2 = (c2); \
+  COPY_CREF_OMOD(c1, __tmp_c2); \
   c1->nd_clss = __tmp_c2->nd_clss; \
   c1->nd_visi = __tmp_c2->nd_visi;\
   c1->nd_next = __tmp_c2->nd_next; \
 } while (0)
 
-#define CALL_METHOD(num, blockptr, flag, id, me, recv) do { \
-    VALUE v = vm_call_method(th, GET_CFP(), num, blockptr, flag, id, me, recv); \
+#define CALL_METHOD(num, blockptr, flag, id, me, recv, defined_class) do { \
+    VALUE v = vm_call_method(th, GET_CFP(), num, blockptr, flag, id, me, recv, defined_class); \
     if (v == Qundef) { \
 	RESTORE_REGS(); \
 	NEXT_INSN(); \
@@ -192,8 +201,9 @@ extern VALUE ruby_vm_const_missing_count;
 #if USE_IC_FOR_SPECIALIZED_METHOD
 
 #define CALL_SIMPLE_METHOD(num, id, recv) do { \
-    VALUE klass = CLASS_OF(recv); \
-    CALL_METHOD(num, 0, 0, id, vm_method_search(id, klass, ic), recv); \
+    VALUE klass = CLASS_OF(recv), defined_class; \
+    const rb_method_entry_t *me = vm_method_search(id, klass, ic, &defined_class); \
+    CALL_METHOD(num, 0, 0, id, me, recv, defined_class); \
 } while (0)
 
 #else

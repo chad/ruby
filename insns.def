@@ -183,7 +183,7 @@ getclassvariable
 ()
 (VALUE val)
 {
-    NODE * const cref = vm_get_cref(GET_ISEQ(), GET_LFP(), GET_DFP());
+    NODE * const cref = rb_vm_get_cref(GET_ISEQ(), GET_LFP(), GET_DFP());
     val = rb_cvar_get(vm_get_cvar_base(cref), id);
 }
 
@@ -198,7 +198,7 @@ setclassvariable
 (VALUE val)
 ()
 {
-    NODE * const cref = vm_get_cref(GET_ISEQ(), GET_LFP(), GET_DFP());
+    NODE * const cref = rb_vm_get_cref(GET_ISEQ(), GET_LFP(), GET_DFP());
     rb_cvar_set(vm_get_cvar_base(cref), id, val);
 }
 
@@ -788,7 +788,7 @@ defined
 	break;
       case DEFINED_METHOD:{
 	VALUE klass = CLASS_OF(v);
-	const rb_method_entry_t *me = rb_method_entry(klass, SYM2ID(obj));
+	const rb_method_entry_t *me = rb_method_entry(klass, SYM2ID(obj), 0);
 
 	if (me) {
 	    if (!(me->flag & NOEX_PRIVATE)) {
@@ -960,7 +960,7 @@ defineclass
 
     /* enter scope */
     vm_push_frame(th, class_iseq,
-		  VM_FRAME_MAGIC_CLASS, klass, (VALUE) GET_BLOCK_PTR(),
+		  VM_FRAME_MAGIC_CLASS, klass, 0, (VALUE) GET_BLOCK_PTR(),
 		  class_iseq->iseq_encoded, GET_SP(), 0,
 		  class_iseq->local_size);
     RESTORE_REGS();
@@ -992,7 +992,7 @@ send
 (VALUE val) // inc += - (int)(op_argc + ((op_flag & VM_CALL_ARGS_BLOCKARG_BIT) ? 1 : 0));
 {
     const rb_method_entry_t *me;
-    VALUE recv, klass;
+    VALUE recv, klass, defined_class;
     rb_block_t *blockptr = 0;
     int num = caller_setup_args(th, GET_CFP(), op_flag, (int)op_argc,
 				(rb_iseq_t *)blockiseq, &blockptr);
@@ -1002,8 +1002,8 @@ send
     /* get receiver */
     recv = (flag & VM_CALL_FCALL_BIT) ? GET_SELF() : TOPN(num);
     klass = CLASS_OF(recv);
-    me = vm_method_search(id, klass, ic);
-    CALL_METHOD(num, blockptr, flag, id, me, recv);
+    me = vm_method_search(id, klass, ic, &defined_class);
+    CALL_METHOD(num, blockptr, flag, id, me, recv, defined_class);
 }
 
 /**
@@ -1026,18 +1026,24 @@ invokesuper
     ID id;
     VALUE flag = VM_CALL_SUPER_BIT | VM_CALL_FCALL_BIT;
     const rb_method_entry_t *me;
+    rb_iseq_t *ip;
 
     recv = GET_SELF();
     vm_search_superclass(GET_CFP(), GET_ISEQ(), recv, TOPN(num), &id, &klass);
 
-    /* temporary measure for [Bug #2402] [Bug #2502] [Bug #3136] */
-    if (!rb_obj_is_kind_of(recv, klass)) {
-	rb_raise(rb_eNotImpError, "super from singleton method that is defined to multiple classes is not supported; this will be fixed in 1.9.3 or later");
+    ip = GET_ISEQ();
+    while (ip && !ip->klass) {
+	ip = ip->parent_iseq;
+    }
+  again:
+    me = rb_method_entry(klass, id, &klass);
+    if (me && me->def->type == VM_METHOD_TYPE_ISEQ &&
+	me->def->body.iseq == ip) {
+	klass = RCLASS_SUPER(klass);
+	goto again;
     }
 
-    me = rb_method_entry(klass, id);
-
-    CALL_METHOD(num, blockptr, flag, id, me, recv);
+    CALL_METHOD(num, blockptr, flag, id, me, recv, klass);
 }
 
 /**
@@ -1661,7 +1667,7 @@ opt_neq
 (VALUE val)
 {
     extern VALUE rb_obj_not_equal(VALUE obj1, VALUE obj2);
-    const rb_method_entry_t *me = vm_method_search(idNeq, CLASS_OF(recv), ic);
+    const rb_method_entry_t *me = vm_method_search(idNeq, CLASS_OF(recv), ic, 0);
     val = Qundef;
 
     if (check_cfunc(me, rb_obj_not_equal)) {
@@ -2062,7 +2068,7 @@ opt_not
 (VALUE val)
 {
     extern VALUE rb_obj_not(VALUE obj);
-    const rb_method_entry_t *me = vm_method_search(idNot, CLASS_OF(recv), ic);
+    const rb_method_entry_t *me = vm_method_search(idNot, CLASS_OF(recv), ic, 0);
 
     if (check_cfunc(me, rb_obj_not)) {
 	val = RTEST(recv) ? Qfalse : Qtrue;
